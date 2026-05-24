@@ -17,6 +17,7 @@ use serde::Deserialize;
 use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 use sum_tree::Bias;
 use unicode_segmentation::*;
 
@@ -125,6 +126,10 @@ pub enum InputEvent {
 }
 
 pub(super) const CONTEXT: &str = "Input";
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
 
 pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
@@ -2249,38 +2254,110 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let dispatch_started = Instant::now();
         let highlighter_rc = pending.highlighter;
         let parse_task_rc = pending.parse_task;
         let language = pending.language;
         let text = pending.text;
         let is_folding = pending.is_folding;
+        let text_bytes = text.len();
 
         let old_tree = highlighter_rc
             .borrow()
             .as_ref()
             .and_then(|h| h.tree().cloned());
+        let has_old_tree = old_tree.is_some();
 
         // Extract injection parse data on the main thread before spawning, so that
         // compute_injection_layers can also run on the background thread.
+        let phase_started = Instant::now();
         let injection_data = highlighter_rc
             .borrow()
             .as_ref()
             .and_then(|h| h.injection_parse_data());
+        let has_injection_data = injection_data.is_some();
+        tracing::info!(
+            operation = "syntax_background_parse",
+            phase = "prepare_dispatch",
+            language = %language,
+            text_bytes,
+            has_old_tree,
+            has_injection_data,
+            is_folding,
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax background parse phase completed"
+        );
 
         let text_for_apply = text.clone();
+        tracing::info!(
+            operation = "syntax_background_parse",
+            language = %language,
+            status = "dispatched",
+            text_bytes,
+            has_old_tree,
+            has_injection_data,
+            is_folding,
+            elapsed_ms = duration_ms(dispatch_started.elapsed()),
+            "syntax background parse dispatched"
+        );
         let task = cx.spawn_in(window, async move |entity, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    let parse_started = Instant::now();
+                    let phase_started = Instant::now();
                     let Some(config) = LanguageRegistry::singleton().language(&language) else {
+                        tracing::warn!(
+                            operation = "syntax_background_parse",
+                            phase = "registry_lookup",
+                            language = %language,
+                            status = "error",
+                            reason = "missing_language",
+                            elapsed_ms = duration_ms(phase_started.elapsed()),
+                            "syntax background parse failed"
+                        );
                         return None;
                     };
+                    tracing::info!(
+                        operation = "syntax_background_parse",
+                        phase = "registry_lookup",
+                        language = %language,
+                        resolved_language = %config.name,
+                        elapsed_ms = duration_ms(phase_started.elapsed()),
+                        "syntax background parse phase completed"
+                    );
 
+                    let phase_started = Instant::now();
                     let mut parser = tree_sitter::Parser::new();
+                    tracing::info!(
+                        operation = "syntax_background_parse",
+                        phase = "parser_new",
+                        language = %config.name,
+                        elapsed_ms = duration_ms(phase_started.elapsed()),
+                        "syntax background parse phase completed"
+                    );
+
+                    let phase_started = Instant::now();
                     if parser.set_language(&config.language).is_err() {
+                        tracing::warn!(
+                            operation = "syntax_background_parse",
+                            phase = "parser_set_language",
+                            language = %config.name,
+                            status = "error",
+                            elapsed_ms = duration_ms(phase_started.elapsed()),
+                            "syntax background parse failed"
+                        );
                         return None;
                     }
+                    tracing::info!(
+                        operation = "syntax_background_parse",
+                        phase = "parser_set_language",
+                        language = %config.name,
+                        elapsed_ms = duration_ms(phase_started.elapsed()),
+                        "syntax background parse phase completed"
+                    );
 
+                    let phase_started = Instant::now();
                     let new_tree = parser.parse_with_options(
                         &mut |offset, _| {
                             if offset >= text.len() {
@@ -2292,10 +2369,31 @@ impl InputState {
                         },
                         old_tree.as_ref(),
                         None,
-                    )?;
+                    );
+                    let Some(new_tree) = new_tree else {
+                        tracing::warn!(
+                            operation = "syntax_background_parse",
+                            phase = "parse_with_options",
+                            language = %config.name,
+                            status = "error",
+                            text_bytes,
+                            elapsed_ms = duration_ms(phase_started.elapsed()),
+                            "syntax background parse failed"
+                        );
+                        return None;
+                    };
+                    tracing::info!(
+                        operation = "syntax_background_parse",
+                        phase = "parse_with_options",
+                        language = %config.name,
+                        text_bytes,
+                        elapsed_ms = duration_ms(phase_started.elapsed()),
+                        "syntax background parse phase completed"
+                    );
 
                     // Compute injection layers in the background to avoid blocking the
                     // main thread with combined-injection parsing (e.g. PHP, HTML+JS/CSS).
+                    let phase_started = Instant::now();
                     let injection_layers = if let Some(data) = injection_data {
                         crate::highlighter::SyntaxHighlighter::compute_injection_layers(
                             data, &new_tree, &text,
@@ -2303,19 +2401,45 @@ impl InputState {
                     } else {
                         Default::default()
                     };
+                    tracing::info!(
+                        operation = "syntax_background_parse",
+                        phase = "compute_injection_layers",
+                        language = %config.name,
+                        elapsed_ms = duration_ms(phase_started.elapsed()),
+                        "syntax background parse phase completed"
+                    );
 
                     // Walk the syntax tree to extract fold ranges off the main thread.
+                    let phase_started = Instant::now();
                     let fold_ranges = if is_folding {
                         crate::input::display_map::extract_fold_ranges(&new_tree)
                     } else {
                         Vec::new()
                     };
+                    tracing::info!(
+                        operation = "syntax_background_parse",
+                        phase = "extract_fold_ranges",
+                        language = %config.name,
+                        is_folding,
+                        fold_range_count = fold_ranges.len(),
+                        elapsed_ms = duration_ms(phase_started.elapsed()),
+                        "syntax background parse phase completed"
+                    );
+                    tracing::info!(
+                        operation = "syntax_background_parse",
+                        language = %config.name,
+                        status = "completed",
+                        text_bytes,
+                        elapsed_ms = duration_ms(parse_started.elapsed()),
+                        "syntax background parse completed"
+                    );
 
                     Some((new_tree, injection_layers, fold_ranges))
                 })
                 .await;
 
             if let Some((new_tree, injection_layers, fold_ranges)) = result {
+                let apply_started = Instant::now();
                 if let Some(h) = highlighter_rc.borrow_mut().as_mut() {
                     h.apply_background_tree(new_tree, &text_for_apply, injection_layers);
                 }
@@ -2328,6 +2452,20 @@ impl InputState {
                     }
                     cx.notify();
                 });
+                tracing::info!(
+                    operation = "syntax_background_parse",
+                    phase = "apply_result",
+                    text_bytes = text_for_apply.len(),
+                    elapsed_ms = duration_ms(apply_started.elapsed()),
+                    "syntax background parse phase completed"
+                );
+            } else {
+                tracing::warn!(
+                    operation = "syntax_background_parse",
+                    status = "dropped",
+                    text_bytes = text_for_apply.len(),
+                    "syntax background parse produced no result"
+                );
             }
         });
 

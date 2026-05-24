@@ -19,6 +19,10 @@ use tree_sitter::{
 /// range, we recurse into its children instead of querying it directly.
 const LARGE_NODE_THRESHOLD: usize = 8 * 1024;
 
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
 /// A syntax highlighter that supports incremental parsing, multiline text,
 /// and caching of highlight results.
 #[allow(unused)]
@@ -211,10 +215,24 @@ impl<'a> sum_tree::Dimension<'a, HighlightSummary> for Range<usize> {
 impl SyntaxHighlighter {
     /// Create a new SyntaxHighlighter for the given language.
     pub fn new(lang: &str) -> Self {
+        let started = Instant::now();
         match Self::build_for_language(&lang) {
-            Ok(result) => result,
+            Ok(result) => {
+                tracing::info!(
+                    operation = "syntax_highlighter_new",
+                    language = lang,
+                    status = "ok",
+                    elapsed_ms = duration_ms(started.elapsed()),
+                    "syntax highlighter created"
+                );
+                result
+            }
             Err(err) => {
                 tracing::warn!(
+                    operation = "syntax_highlighter_new",
+                    language = lang,
+                    status = "fallback",
+                    elapsed_ms = duration_ms(started.elapsed()),
                     "SyntaxHighlighter init failed, fallback to use `text`, {}",
                     err
                 );
@@ -227,30 +245,82 @@ impl SyntaxHighlighter {
     ///
     /// https://github.com/tree-sitter/tree-sitter/blob/v0.26.8/crates/highlight/src/highlight.rs#L339
     fn build_for_language(lang: &str) -> Result<Self> {
+        let build_started = Instant::now();
+
+        let phase_started = Instant::now();
         let Some(config) = LanguageRegistry::singleton().language(&lang) else {
             return Err(anyhow!(
                 "language {:?} is not registered in `LanguageRegistry`",
                 lang
             ));
         };
+        tracing::info!(
+            operation = "syntax_highlighter_build",
+            phase = "registry_lookup",
+            language = lang,
+            resolved_language = %config.name,
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax highlighter build phase completed"
+        );
 
+        let phase_started = Instant::now();
         let mut parser = Parser::new();
+        tracing::info!(
+            operation = "syntax_highlighter_build",
+            phase = "parser_new",
+            language = %config.name,
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax highlighter build phase completed"
+        );
+
+        let phase_started = Instant::now();
         parser
             .set_language(&config.language)
             .context("parse set_language")?;
+        tracing::info!(
+            operation = "syntax_highlighter_build",
+            phase = "parser_set_language",
+            language = %config.name,
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax highlighter build phase completed"
+        );
 
         // Concatenate the query strings, keeping track of the start offset of each section.
+        let phase_started = Instant::now();
         let mut query_source = String::new();
         query_source.push_str(&config.injections);
         let locals_query_offset = query_source.len();
         query_source.push_str(&config.locals);
         let highlights_query_offset = query_source.len();
         query_source.push_str(&config.highlights);
+        tracing::info!(
+            operation = "syntax_highlighter_build",
+            phase = "query_concat",
+            language = %config.name,
+            injections_bytes = config.injections.len(),
+            locals_bytes = config.locals.len(),
+            highlights_bytes = config.highlights.len(),
+            query_source_bytes = query_source.len(),
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax highlighter build phase completed"
+        );
 
         // Construct a single query by concatenating the three query strings, but record the
         // range of pattern indices that belong to each individual string.
+        let phase_started = Instant::now();
         let mut query = Query::new(&config.language, &query_source).context("new query")?;
+        tracing::info!(
+            operation = "syntax_highlighter_build",
+            phase = "main_query_new",
+            language = %config.name,
+            query_source_bytes = query_source.len(),
+            pattern_count = query.pattern_count(),
+            capture_count = query.capture_names().len(),
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax highlighter build phase completed"
+        );
 
+        let phase_started = Instant::now();
         let mut locals_pattern_index = 0;
         let mut highlights_pattern_index = 0;
         for i in 0..(query.pattern_count()) {
@@ -264,7 +334,17 @@ impl SyntaxHighlighter {
                 }
             }
         }
+        tracing::info!(
+            operation = "syntax_highlighter_build",
+            phase = "pattern_index_scan",
+            language = %config.name,
+            locals_pattern_index,
+            highlights_pattern_index,
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax highlighter build phase completed"
+        );
 
+        let phase_started = Instant::now();
         let injections_query = if !config.injections.is_empty() {
             Query::new(&config.language, &config.injections)
                 .ok()
@@ -272,15 +352,34 @@ impl SyntaxHighlighter {
         } else {
             None
         };
+        tracing::info!(
+            operation = "syntax_highlighter_build",
+            phase = "injections_query_new",
+            language = %config.name,
+            injections_bytes = config.injections.len(),
+            has_injections_query = injections_query.is_some(),
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax highlighter build phase completed"
+        );
 
         // Injection layers are computed separately during parsing, so do not
         // emit injection captures from the main highlight query.
+        let phase_started = Instant::now();
         for pattern_index in 0..locals_pattern_index {
             query.disable_pattern(pattern_index);
         }
+        tracing::info!(
+            operation = "syntax_highlighter_build",
+            phase = "disable_injection_patterns",
+            language = %config.name,
+            disabled_patterns = locals_pattern_index,
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax highlighter build phase completed"
+        );
 
         // Find all of the highlighting patterns that are disabled for nodes that
         // have been identified as local variables.
+        let phase_started = Instant::now();
         let non_local_variable_patterns = (0..query.pattern_count())
             .map(|i| {
                 query
@@ -289,8 +388,17 @@ impl SyntaxHighlighter {
                     .any(|(prop, positive)| !*positive && prop.key.as_ref() == "local")
             })
             .collect();
+        tracing::info!(
+            operation = "syntax_highlighter_build",
+            phase = "non_local_pattern_scan",
+            language = %config.name,
+            pattern_count = query.pattern_count(),
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax highlighter build phase completed"
+        );
 
         // Store the numeric ids for all of the special captures.
+        let phase_started = Instant::now();
         let injection_content_capture_index = injections_query.as_ref().and_then(|q| {
             q.capture_names()
                 .iter()
@@ -317,7 +425,16 @@ impl SyntaxHighlighter {
                 _ => {}
             }
         }
+        tracing::info!(
+            operation = "syntax_highlighter_build",
+            phase = "capture_index_scan",
+            language = %config.name,
+            capture_count = query.capture_names().len(),
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax highlighter build phase completed"
+        );
 
+        let phase_started = Instant::now();
         let mut injection_queries = HashMap::new();
         for inj_language in config.injection_languages.iter() {
             if let Some(inj_config) = LanguageRegistry::singleton().language(&inj_language) {
@@ -335,8 +452,27 @@ impl SyntaxHighlighter {
                 }
             }
         }
+        tracing::info!(
+            operation = "syntax_highlighter_build",
+            phase = "injection_language_queries",
+            language = %config.name,
+            injection_language_count = config.injection_languages.len(),
+            compiled_injection_query_count = injection_queries.len(),
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax highlighter build phase completed"
+        );
 
         // let highlight_indices = vec![None; query.capture_names().len()];
+        tracing::info!(
+            operation = "syntax_highlighter_build",
+            language = %config.name,
+            status = "ok",
+            pattern_count = query.pattern_count(),
+            capture_count = query.capture_names().len(),
+            injection_query_count = injection_queries.len(),
+            elapsed_ms = duration_ms(build_started.elapsed()),
+            "syntax highlighter built"
+        );
 
         Ok(Self {
             language: config.name.clone(),
@@ -393,7 +529,20 @@ impl SyntaxHighlighter {
         text: &Rope,
         timeout: Option<Duration>,
     ) -> bool {
+        let update_started = Instant::now();
+        let language = self.language.clone();
+        let text_bytes = text.len();
+        let timeout_ms = timeout.map(duration_ms);
+
         if self.text.eq(text) {
+            tracing::debug!(
+                operation = "syntax_highlighter_update",
+                language = %language,
+                status = "noop",
+                text_bytes,
+                elapsed_ms = duration_ms(update_started.elapsed()),
+                "syntax highlighter update skipped"
+            );
             return true;
         }
 
@@ -406,11 +555,22 @@ impl SyntaxHighlighter {
             new_end_position: Point::new(0, 0),
         });
 
+        let phase_started = Instant::now();
+        let had_old_tree = self.tree.is_some();
         let mut old_tree = self
             .tree
             .take()
             .unwrap_or(self.parser.parse("", None).unwrap());
         old_tree.edit(&edit);
+        tracing::info!(
+            operation = "syntax_highlighter_update",
+            phase = "prepare_old_tree",
+            language = %language,
+            text_bytes,
+            had_old_tree,
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax highlighter update phase completed"
+        );
 
         let mut timed_out = false;
         let start = Instant::now();
@@ -428,6 +588,7 @@ impl SyntaxHighlighter {
         };
 
         let options = ParseOptions::new().progress_callback(&mut progress);
+        let phase_started = Instant::now();
         let new_tree = self.parser.parse_with_options(
             &mut move |offset, _| {
                 if offset >= text.len() {
@@ -440,18 +601,58 @@ impl SyntaxHighlighter {
             Some(&old_tree),
             Some(options),
         );
+        let parse_elapsed = phase_started.elapsed();
+        let parse_returned_tree = new_tree.is_some();
+        tracing::info!(
+            operation = "syntax_highlighter_update",
+            phase = "parse_with_options",
+            language = %language,
+            text_bytes,
+            timeout_ms,
+            timed_out,
+            parse_returned_tree,
+            elapsed_ms = duration_ms(parse_elapsed),
+            "syntax highlighter update phase completed"
+        );
 
         if timed_out || new_tree.is_none() {
             // Restore the old tree so highlighting continues with stale data.
             self.tree = Some(old_tree);
             self.text = text.clone();
+            tracing::info!(
+                operation = "syntax_highlighter_update",
+                language = %language,
+                status = "timed_out",
+                text_bytes,
+                timeout_ms,
+                elapsed_ms = duration_ms(update_started.elapsed()),
+                "syntax highlighter update deferred"
+            );
             return false;
         }
 
         let new_tree = new_tree.unwrap();
         self.tree = Some(new_tree.clone());
         self.text = text.clone();
+        let phase_started = Instant::now();
         self.parse_injection_layers(&new_tree);
+        tracing::info!(
+            operation = "syntax_highlighter_update",
+            phase = "parse_injection_layers",
+            language = %language,
+            text_bytes,
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax highlighter update phase completed"
+        );
+        tracing::info!(
+            operation = "syntax_highlighter_update",
+            language = %language,
+            status = "completed",
+            text_bytes,
+            timeout_ms,
+            elapsed_ms = duration_ms(update_started.elapsed()),
+            "syntax highlighter update completed"
+        );
         true
     }
 
@@ -492,10 +693,7 @@ impl SyntaxHighlighter {
         }
 
         fn ranges_cache_key(ranges: &[tree_sitter::Range]) -> Vec<(usize, usize)> {
-            ranges
-                .iter()
-                .map(|r| (r.start_byte, r.end_byte))
-                .collect()
+            ranges.iter().map(|r| (r.start_byte, r.end_byte)).collect()
         }
 
         let root_node = tree.root_node();
@@ -986,7 +1184,6 @@ fn collect_query_nodes_inner<'a>(
 
     out.push(node);
 }
-
 
 /// Merge other style (Other on top)
 fn merge_highlight_style(style: &mut HighlightStyle, other: &HighlightStyle) {

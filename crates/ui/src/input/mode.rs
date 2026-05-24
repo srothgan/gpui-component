@@ -1,5 +1,5 @@
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{cell::RefCell, ops::Range};
 
 use gpui::{App, SharedString, Task};
@@ -9,6 +9,10 @@ use super::display_map::DisplayMap;
 use crate::highlighter::DiagnosticSet;
 use crate::highlighter::SyntaxHighlighter;
 use crate::input::{InputEdit, RopeExt as _, TabSize};
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
 
 #[allow(dead_code)]
 pub(super) struct PendingBackgroundParse {
@@ -231,6 +235,7 @@ impl InputMode {
         force: bool,
         cx: &mut App,
     ) -> Option<PendingBackgroundParse> {
+        let update_started = Instant::now();
         match &self {
             InputMode::CodeEditor {
                 language,
@@ -240,26 +245,82 @@ impl InputMode {
                 ..
             } => {
                 if !force && highlighter.borrow().is_some() {
+                    tracing::debug!(
+                        operation = "input_update_highlighter",
+                        language = %language,
+                        status = "skipped",
+                        reason = "existing_highlighter",
+                        force,
+                        elapsed_ms = duration_ms(update_started.elapsed()),
+                        "input highlighter update skipped"
+                    );
                     return None;
                 }
 
                 let mut highlighter_ref = highlighter.borrow_mut();
                 if highlighter_ref.is_none() {
+                    let phase_started = Instant::now();
                     let new_highlighter = SyntaxHighlighter::new(language);
                     highlighter_ref.replace(new_highlighter);
+                    tracing::info!(
+                        operation = "input_update_highlighter",
+                        phase = "create_highlighter",
+                        language = %language,
+                        elapsed_ms = duration_ms(phase_started.elapsed()),
+                        "input highlighter update phase completed"
+                    );
                 }
 
                 let Some(h) = highlighter_ref.as_mut() else {
+                    tracing::warn!(
+                        operation = "input_update_highlighter",
+                        language = %language,
+                        status = "error",
+                        reason = "missing_highlighter",
+                        elapsed_ms = duration_ms(update_started.elapsed()),
+                        "input highlighter update failed"
+                    );
                     return None;
                 };
 
+                let phase_started = Instant::now();
                 let edit = replacement_input_edit(old_text, new_text, selected_range, change_text);
+                tracing::info!(
+                    operation = "input_update_highlighter",
+                    phase = "replacement_input_edit",
+                    language = %language,
+                    selected_start = selected_range.start,
+                    selected_end = selected_range.end,
+                    old_text_bytes = old_text.len(),
+                    new_text_bytes = new_text.len(),
+                    change_text_bytes = change_text.len(),
+                    force,
+                    elapsed_ms = duration_ms(phase_started.elapsed()),
+                    "input highlighter update phase completed"
+                );
 
                 const SYNC_PARSE_TIMEOUT: Duration = Duration::from_millis(2);
+                let phase_started = Instant::now();
                 let completed = h.update(Some(edit), new_text, Some(SYNC_PARSE_TIMEOUT));
+                tracing::info!(
+                    operation = "input_update_highlighter",
+                    phase = "syntax_highlighter_update",
+                    language = %language,
+                    completed,
+                    sync_parse_timeout_ms = duration_ms(SYNC_PARSE_TIMEOUT),
+                    elapsed_ms = duration_ms(phase_started.elapsed()),
+                    "input highlighter update phase completed"
+                );
                 if completed {
                     // Sync parse succeeded, cancel any pending background parse.
                     parse_task.borrow_mut().take();
+                    tracing::info!(
+                        operation = "input_update_highlighter",
+                        language = %language,
+                        status = "completed_sync",
+                        elapsed_ms = duration_ms(update_started.elapsed()),
+                        "input highlighter update completed"
+                    );
                     None
                 } else {
                     // Timed out. Return the data needed for background parsing.
@@ -271,10 +332,26 @@ impl InputMode {
                         is_folding: *folding,
                     };
                     drop(highlighter_ref);
+                    tracing::info!(
+                        operation = "input_update_highlighter",
+                        language = %language,
+                        status = "scheduled_background_parse",
+                        elapsed_ms = duration_ms(update_started.elapsed()),
+                        "input highlighter update deferred"
+                    );
                     Some(pending)
                 }
             }
-            _ => None,
+            _ => {
+                tracing::debug!(
+                    operation = "input_update_highlighter",
+                    status = "skipped",
+                    reason = "not_code_editor",
+                    elapsed_ms = duration_ms(update_started.elapsed()),
+                    "input highlighter update skipped"
+                );
+                None
+            }
         }
     }
 
