@@ -84,13 +84,23 @@ pub struct LanguageConfig {
     pub name: SharedString,
 }
 
+pub struct CompiledLanguage {
+    name: SharedString,
+}
+
+impl CompiledLanguage {
+    pub fn name(&self) -> &SharedString {
+        &self.name
+    }
+}
+
 // Re-export theme types from registry module (which will be conditionally compiled)
 // For WASM, we create minimal stubs here
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    sync::{LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, JsonSchema, Serialize, Deserialize)]
@@ -301,4 +311,16 @@ impl LanguageRegistry {
     pub fn language(&self, name: &str) -> Option<LanguageConfig> {
         self.languages.lock().unwrap().get(name).cloned()
     }
+
+    pub fn compiled_language(&self, name: &str) -> anyhow::Result<Arc<CompiledLanguage>> {
+        self.language(name)
+            .map(|config| Arc::new(CompiledLanguage { name: config.name }))
+            .ok_or_else(|| anyhow::anyhow!("language {:?} is not registered", name))
+    }
+
+    pub fn warm_language(&self, name: &str) -> anyhow::Result<Arc<CompiledLanguage>> {
+        self.compiled_language(name)
+    }
+
+    pub fn clear_compiled_language(&self, _name: &str) {}
 }

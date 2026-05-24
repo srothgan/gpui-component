@@ -1,3 +1,4 @@
+use anyhow::{Context, Result, anyhow};
 use gpui::{App, FontWeight, HighlightStyle, Hsla, SharedString};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -6,7 +7,9 @@ use std::{
     collections::HashMap,
     ops::Deref,
     sync::{Arc, LazyLock, Mutex},
+    time::{Duration, Instant},
 };
+use tree_sitter::Query;
 
 use crate::{
     ActiveTheme, DEFAULT_THEME_COLORS, ThemeMode,
@@ -84,6 +87,39 @@ impl LanguageConfig {
             injections: SharedString::from(injections.to_string()),
             locals: SharedString::from(locals.to_string()),
         }
+    }
+}
+
+#[derive(Debug)]
+#[allow(unused)]
+pub(crate) struct HighlightQueryMetadata {
+    pub(crate) locals_pattern_index: usize,
+    pub(crate) highlights_pattern_index: usize,
+    pub(crate) non_local_variable_patterns: Vec<bool>,
+    pub(crate) injection_content_capture_index: Option<u32>,
+    pub(crate) injection_language_capture_index: Option<u32>,
+    pub(crate) local_scope_capture_index: Option<u32>,
+    pub(crate) local_def_capture_index: Option<u32>,
+    pub(crate) local_def_value_capture_index: Option<u32>,
+    pub(crate) local_ref_capture_index: Option<u32>,
+}
+
+/// Shared, immutable tree-sitter language assets.
+///
+/// This intentionally does not store parsers, trees, text, or injection layers;
+/// those remain per [`SyntaxHighlighter`](super::SyntaxHighlighter).
+pub struct CompiledLanguage {
+    pub(crate) name: SharedString,
+    pub(crate) language: tree_sitter::Language,
+    pub(crate) query: Query,
+    pub(crate) injections_query: Option<Arc<Query>>,
+    pub(crate) injection_queries: HashMap<SharedString, Arc<Query>>,
+    pub(crate) metadata: HighlightQueryMetadata,
+}
+
+impl CompiledLanguage {
+    pub fn name(&self) -> &SharedString {
+        &self.name
     }
 }
 
@@ -467,6 +503,7 @@ impl HighlightTheme {
 /// Registry for code highlighter languages.
 pub struct LanguageRegistry {
     languages: Mutex<HashMap<SharedString, LanguageConfig>>,
+    compiled_languages: Mutex<HashMap<SharedString, Arc<CompiledLanguage>>>,
 }
 
 impl LanguageRegistry {
@@ -478,6 +515,7 @@ impl LanguageRegistry {
                     .map(|language| (language.name().into(), language.config()))
                     .collect(),
             ),
+            compiled_languages: Mutex::new(HashMap::new()),
         });
         &INSTANCE
     }
@@ -488,6 +526,19 @@ impl LanguageRegistry {
             .lock()
             .unwrap()
             .insert(lang.to_string().into(), config.clone());
+        let mut compiled_languages = self.compiled_languages.lock().unwrap();
+        let mut invalidated = 0;
+        invalidated += compiled_languages.remove(lang).is_some() as usize;
+        if config.name.as_ref() != lang {
+            invalidated += compiled_languages.remove(&config.name).is_some() as usize;
+        }
+        tracing::debug!(
+            operation = "syntax_language_cache",
+            language = lang,
+            status = "invalidated",
+            invalidated_count = invalidated,
+            "syntax language cache invalidated after registration"
+        );
     }
 
     /// Returns a list of all registered language names.
@@ -499,16 +550,326 @@ impl LanguageRegistry {
     pub fn language(&self, name: &str) -> Option<LanguageConfig> {
         // Try to get by name first, there may have a custom language registered
         // Then try to get built-in language to support short language names, e.g. "js" for "javascript"
+        self.resolve_language_config(name).map(|(_, config)| config)
+    }
+
+    /// Returns the compiled language assets for the given language name.
+    ///
+    /// Query compilation is expensive for some grammars, so this cache is shared
+    /// by all highlighter instances. Parsers and trees are still per highlighter.
+    pub fn compiled_language(&self, name: &str) -> Result<Arc<CompiledLanguage>> {
+        let started = Instant::now();
+        let (cache_key, config) = self.resolve_language_config(name).ok_or_else(|| {
+            anyhow!(
+                "language {:?} is not registered in `LanguageRegistry`",
+                name
+            )
+        })?;
+
+        if let Some(compiled) = self
+            .compiled_languages
+            .lock()
+            .unwrap()
+            .get(&cache_key)
+            .cloned()
+        {
+            tracing::debug!(
+                operation = "syntax_language_cache",
+                language = name,
+                resolved_language = %compiled.name,
+                status = "hit",
+                elapsed_ms = duration_ms(started.elapsed()),
+                "syntax language cache hit"
+            );
+            return Ok(compiled);
+        }
+
+        tracing::info!(
+            operation = "syntax_language_cache",
+            language = name,
+            resolved_language = %config.name,
+            status = "miss",
+            elapsed_ms = duration_ms(started.elapsed()),
+            "syntax language cache miss"
+        );
+
+        let compiled = Arc::new(self.compile_language(&config)?);
+        let mut compiled_languages = self.compiled_languages.lock().unwrap();
+        if let Some(existing) = compiled_languages.get(&cache_key).cloned() {
+            tracing::debug!(
+                operation = "syntax_language_cache",
+                language = name,
+                resolved_language = %existing.name,
+                status = "hit_after_compile",
+                elapsed_ms = duration_ms(started.elapsed()),
+                "syntax language cache filled while compiling"
+            );
+            return Ok(existing);
+        }
+
+        compiled_languages.insert(cache_key, compiled.clone());
+        tracing::info!(
+            operation = "syntax_language_cache",
+            language = name,
+            resolved_language = %compiled.name,
+            status = "stored",
+            elapsed_ms = duration_ms(started.elapsed()),
+            "syntax language cached"
+        );
+        Ok(compiled)
+    }
+
+    /// Warms the compiled language cache and returns the cached assets.
+    pub fn warm_language(&self, name: &str) -> Result<Arc<CompiledLanguage>> {
+        self.compiled_language(name)
+    }
+
+    /// Clears a compiled language cache entry.
+    pub fn clear_compiled_language(&self, name: &str) {
+        let resolved = self
+            .resolve_language_config(name)
+            .map(|(cache_key, config)| (cache_key, config.name));
+        let mut compiled_languages = self.compiled_languages.lock().unwrap();
+        let mut removed = compiled_languages.remove(name).is_some();
+        if let Some((cache_key, config_name)) = resolved {
+            removed |= compiled_languages.remove(&cache_key).is_some();
+            removed |= compiled_languages.remove(&config_name).is_some();
+        }
+        tracing::debug!(
+            operation = "syntax_language_cache",
+            language = name,
+            status = "cleared",
+            removed,
+            "syntax language cache entry cleared"
+        );
+    }
+
+    fn resolve_language_config(&self, name: &str) -> Option<(SharedString, LanguageConfig)> {
         let languages = self.languages.lock().unwrap();
-        languages.get(name).cloned().or_else(|| {
-            Language::from_name(name).and_then(|language| languages.get(language.name()).cloned())
+        languages
+            .get_key_value(name)
+            .map(|(key, config)| (key.clone(), config.clone()))
+            .or_else(|| {
+                Language::from_name(name).and_then(|language| {
+                    languages
+                        .get_key_value(language.name())
+                        .map(|(key, config)| (key.clone(), config.clone()))
+                })
+            })
+    }
+
+    fn compile_language(&self, config: &LanguageConfig) -> Result<CompiledLanguage> {
+        let compile_started = Instant::now();
+
+        let phase_started = Instant::now();
+        let mut query_source = String::new();
+        query_source.push_str(&config.injections);
+        let locals_query_offset = query_source.len();
+        query_source.push_str(&config.locals);
+        let highlights_query_offset = query_source.len();
+        query_source.push_str(&config.highlights);
+        tracing::info!(
+            operation = "syntax_language_compile",
+            phase = "query_concat",
+            language = %config.name,
+            injections_bytes = config.injections.len(),
+            locals_bytes = config.locals.len(),
+            highlights_bytes = config.highlights.len(),
+            query_source_bytes = query_source.len(),
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax language compile phase completed"
+        );
+
+        let phase_started = Instant::now();
+        let mut query = Query::new(&config.language, &query_source).context("new query")?;
+        tracing::info!(
+            operation = "syntax_language_compile",
+            phase = "main_query_new",
+            language = %config.name,
+            query_source_bytes = query_source.len(),
+            pattern_count = query.pattern_count(),
+            capture_count = query.capture_names().len(),
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax language compile phase completed"
+        );
+
+        let phase_started = Instant::now();
+        let mut locals_pattern_index = 0;
+        let mut highlights_pattern_index = 0;
+        for i in 0..(query.pattern_count()) {
+            let pattern_offset = query.start_byte_for_pattern(i);
+            if pattern_offset < highlights_query_offset {
+                if pattern_offset < highlights_query_offset {
+                    highlights_pattern_index += 1;
+                }
+                if pattern_offset < locals_query_offset {
+                    locals_pattern_index += 1;
+                }
+            }
+        }
+        tracing::info!(
+            operation = "syntax_language_compile",
+            phase = "pattern_index_scan",
+            language = %config.name,
+            locals_pattern_index,
+            highlights_pattern_index,
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax language compile phase completed"
+        );
+
+        let phase_started = Instant::now();
+        let injections_query = if !config.injections.is_empty() {
+            Query::new(&config.language, &config.injections)
+                .ok()
+                .map(Arc::new)
+        } else {
+            None
+        };
+        tracing::info!(
+            operation = "syntax_language_compile",
+            phase = "injections_query_new",
+            language = %config.name,
+            injections_bytes = config.injections.len(),
+            has_injections_query = injections_query.is_some(),
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax language compile phase completed"
+        );
+
+        let phase_started = Instant::now();
+        for pattern_index in 0..locals_pattern_index {
+            query.disable_pattern(pattern_index);
+        }
+        tracing::info!(
+            operation = "syntax_language_compile",
+            phase = "disable_injection_patterns",
+            language = %config.name,
+            disabled_patterns = locals_pattern_index,
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax language compile phase completed"
+        );
+
+        let phase_started = Instant::now();
+        let non_local_variable_patterns = (0..query.pattern_count())
+            .map(|i| {
+                query
+                    .property_predicates(i)
+                    .iter()
+                    .any(|(prop, positive)| !*positive && prop.key.as_ref() == "local")
+            })
+            .collect();
+        tracing::info!(
+            operation = "syntax_language_compile",
+            phase = "non_local_pattern_scan",
+            language = %config.name,
+            pattern_count = query.pattern_count(),
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax language compile phase completed"
+        );
+
+        let phase_started = Instant::now();
+        let injection_content_capture_index = injections_query.as_ref().and_then(|q| {
+            q.capture_names()
+                .iter()
+                .position(|name| *name == "injection.content")
+                .map(|i| i as u32)
+        });
+        let injection_language_capture_index = injections_query.as_ref().and_then(|q| {
+            q.capture_names()
+                .iter()
+                .position(|name| *name == "injection.language")
+                .map(|i| i as u32)
+        });
+        let mut local_def_capture_index = None;
+        let mut local_def_value_capture_index = None;
+        let mut local_ref_capture_index = None;
+        let mut local_scope_capture_index = None;
+        for (i, name) in query.capture_names().iter().enumerate() {
+            let i = Some(i as u32);
+            match *name {
+                "local.definition" => local_def_capture_index = i,
+                "local.definition-value" => local_def_value_capture_index = i,
+                "local.reference" => local_ref_capture_index = i,
+                "local.scope" => local_scope_capture_index = i,
+                _ => {}
+            }
+        }
+        tracing::info!(
+            operation = "syntax_language_compile",
+            phase = "capture_index_scan",
+            language = %config.name,
+            capture_count = query.capture_names().len(),
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax language compile phase completed"
+        );
+
+        let phase_started = Instant::now();
+        let mut injection_queries = HashMap::new();
+        for inj_language in config.injection_languages.iter() {
+            if let Some(inj_config) = self.language(inj_language) {
+                match Query::new(&inj_config.language, &inj_config.highlights) {
+                    Ok(q) => {
+                        injection_queries.insert(inj_config.name.clone(), Arc::new(q));
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "failed to build injection query for {:?}: {:?}",
+                            inj_config.name,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+        tracing::info!(
+            operation = "syntax_language_compile",
+            phase = "injection_language_queries",
+            language = %config.name,
+            injection_language_count = config.injection_languages.len(),
+            compiled_injection_query_count = injection_queries.len(),
+            elapsed_ms = duration_ms(phase_started.elapsed()),
+            "syntax language compile phase completed"
+        );
+
+        tracing::info!(
+            operation = "syntax_language_compile",
+            language = %config.name,
+            status = "ok",
+            pattern_count = query.pattern_count(),
+            capture_count = query.capture_names().len(),
+            injection_query_count = injection_queries.len(),
+            elapsed_ms = duration_ms(compile_started.elapsed()),
+            "syntax language compiled"
+        );
+
+        Ok(CompiledLanguage {
+            name: config.name.clone(),
+            language: config.language.clone(),
+            query,
+            injections_query,
+            injection_queries,
+            metadata: HighlightQueryMetadata {
+                locals_pattern_index,
+                highlights_pattern_index,
+                non_local_variable_patterns,
+                injection_content_capture_index,
+                injection_language_capture_index,
+                local_scope_capture_index,
+                local_def_capture_index,
+                local_def_value_capture_index,
+                local_ref_capture_index,
+            },
         })
     }
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
 }
 
 #[cfg(test)]
 mod tests {
     use crate::highlighter::LanguageConfig;
+    use std::sync::Arc;
 
     #[test]
     fn test_registry() {
@@ -546,5 +907,49 @@ mod tests {
             assert!(registry.language("javascript").is_none());
             assert!(registry.language("js").is_none());
         }
+    }
+
+    #[test]
+    fn compiled_language_cache_reuses_compiled_queries() {
+        use super::LanguageRegistry;
+        let registry = LanguageRegistry::singleton();
+
+        let first = registry.warm_language("json").expect("json should compile");
+        let second = registry
+            .warm_language("json")
+            .expect("json should come from cache");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.name().as_ref(), "json");
+    }
+
+    #[test]
+    fn register_invalidates_compiled_language_cache() {
+        use super::LanguageRegistry;
+        let registry = LanguageRegistry::singleton();
+        let language_name = "cache_invalidation_test_json";
+        let config = LanguageConfig::new(
+            language_name,
+            tree_sitter_json::LANGUAGE.into(),
+            vec![],
+            "",
+            "",
+            "",
+        );
+
+        registry.register(language_name, &config);
+        let first = registry
+            .warm_language(language_name)
+            .expect("custom language should compile");
+        let second = registry
+            .warm_language(language_name)
+            .expect("custom language should come from cache");
+        assert!(Arc::ptr_eq(&first, &second));
+
+        registry.register(language_name, &config);
+        let third = registry
+            .warm_language(language_name)
+            .expect("custom language should recompile after registration");
+        assert!(!Arc::ptr_eq(&first, &third));
     }
 }
