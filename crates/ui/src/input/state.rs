@@ -125,6 +125,25 @@ pub enum InputEvent {
     Blur,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HighlighterChange {
+    NotCodeEditor,
+    PlainText,
+    SameLanguageReuse,
+    LanguageChanged,
+}
+
+impl HighlighterChange {
+    pub fn as_trace_status(self) -> &'static str {
+        match self {
+            HighlighterChange::NotCodeEditor => "not_code_editor",
+            HighlighterChange::PlainText => "plain_text",
+            HighlighterChange::SameLanguageReuse => "same_language_reuse",
+            HighlighterChange::LanguageChanged => "direct_language_load",
+        }
+    }
+}
+
 pub(super) const CONTEXT: &str = "Input";
 
 fn duration_ms(duration: Duration) -> f64 {
@@ -665,7 +684,8 @@ impl InputState {
         &mut self,
         new_language: impl Into<SharedString>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> HighlighterChange {
+        let new_language = new_language.into();
         match &mut self.mode {
             InputMode::CodeEditor {
                 language,
@@ -673,28 +693,50 @@ impl InputState {
                 parse_task,
                 ..
             } => {
-                *language = new_language.into();
-                *highlighter.borrow_mut() = None;
-                parse_task.borrow_mut().take();
-            }
-            _ => {}
-        }
-        cx.notify();
-    }
+                if language.as_ref() == new_language.as_ref() {
+                    let change = if new_language.as_ref() == "text" {
+                        HighlighterChange::PlainText
+                    } else {
+                        HighlighterChange::SameLanguageReuse
+                    };
+                    tracing::debug!(
+                        operation = "input_set_highlighter",
+                        language = %new_language,
+                        status = change.as_trace_status(),
+                        "input highlighter language preserved"
+                    );
+                    return change;
+                }
 
-    fn reset_highlighter(&mut self, cx: &mut Context<Self>) {
-        match &mut self.mode {
-            InputMode::CodeEditor {
-                highlighter,
-                parse_task,
-                ..
-            } => {
+                let old_language = language.clone();
+                *language = new_language.clone();
                 *highlighter.borrow_mut() = None;
                 parse_task.borrow_mut().take();
+                let change = if new_language.as_ref() == "text" {
+                    HighlighterChange::PlainText
+                } else {
+                    HighlighterChange::LanguageChanged
+                };
+                tracing::info!(
+                    operation = "input_set_highlighter",
+                    old_language = %old_language,
+                    language = %new_language,
+                    status = change.as_trace_status(),
+                    "input highlighter language changed"
+                );
+                cx.notify();
+                change
             }
-            _ => {}
+            _ => {
+                tracing::debug!(
+                    operation = "input_set_highlighter",
+                    language = %new_language,
+                    status = HighlighterChange::NotCodeEditor.as_trace_status(),
+                    "input highlighter language ignored"
+                );
+                HighlighterChange::NotCodeEditor
+            }
         }
-        cx.notify();
     }
 
     #[inline]
@@ -801,6 +843,30 @@ impl InputState {
         self.disabled = was_disabled;
     }
 
+    /// Reparse the current text with the active highlighter language.
+    pub fn refresh_highlighter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let started = Instant::now();
+        let bg = self
+            .mode
+            .update_highlighter(&(0..0), &self.text, &self.text, "", true, cx);
+        let status = if bg.is_some() {
+            "scheduled_background_parse"
+        } else {
+            "completed_sync"
+        };
+        if let Some(bg) = bg {
+            Self::dispatch_background_parse(bg, window, cx);
+        }
+        tracing::info!(
+            operation = "input_refresh_highlighter",
+            status,
+            text_bytes = self.text.len(),
+            elapsed_ms = duration_ms(started.elapsed()),
+            "input highlighter refreshed"
+        );
+        cx.notify();
+    }
+
     /// Replace text at the current cursor position.
     ///
     /// And the cursor will be moved to the end of replaced text.
@@ -829,7 +895,6 @@ impl InputState {
         let text: SharedString = text.into();
         let range = 0..self.text.chars().map(|c| c.len_utf16()).sum();
         self.replace_text_in_range_silent(Some(range), &text, window, cx);
-        self.reset_highlighter(cx);
         self.disabled = was_disabled;
     }
 
@@ -2793,6 +2858,7 @@ impl Render for InputState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::highlighter::HighlightTheme;
     use crate::theme::Theme;
     use gpui::{TestAppContext, VisualTestContext};
 
@@ -2825,6 +2891,145 @@ mod tests {
                 window_handle: window,
             }
         }
+    }
+
+    fn highlighter_snapshot(
+        cx: &mut VisualTestContext,
+        input: &Entity<InputState>,
+    ) -> Option<(usize, String, bool, usize)> {
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                if let crate::input::mode::InputMode::CodeEditor { highlighter, .. } = &state.mode {
+                    let highlighter = highlighter.borrow();
+                    let highlighter = highlighter.as_ref()?;
+                    return Some((
+                        highlighter as *const _ as usize,
+                        highlighter.language().to_string(),
+                        highlighter.tree().is_some(),
+                        highlighter.text().len(),
+                    ));
+                }
+                None
+            })
+        })
+    }
+
+    #[gpui::test]
+    fn set_highlighter_same_language_preserves_existing_highlighter(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                assert_eq!(
+                    state.set_highlighter("json", cx),
+                    HighlighterChange::LanguageChanged
+                );
+                state.set_value("{\"answer\": 1}", window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let before =
+            highlighter_snapshot(&mut cx, &input).expect("highlighter should be initialized");
+        assert_eq!(before.1, "json");
+        assert!(before.2, "highlighter should have parsed the initial text");
+
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                assert_eq!(
+                    state.set_highlighter("json", cx),
+                    HighlighterChange::SameLanguageReuse
+                );
+            });
+        });
+
+        let after =
+            highlighter_snapshot(&mut cx, &input).expect("highlighter should still be initialized");
+        assert_eq!(before, after);
+    }
+
+    #[gpui::test]
+    fn set_value_with_active_language_initializes_highlighter_without_synthetic_insert(
+        cx: &mut TestAppContext,
+    ) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let text = "{\"active\": true, \"count\": 3}";
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                assert_eq!(
+                    state.set_highlighter("json", cx),
+                    HighlighterChange::LanguageChanged
+                );
+                state.set_value(text, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let snapshot =
+            highlighter_snapshot(&mut cx, &input).expect("highlighter should be initialized");
+        assert_eq!(snapshot.1, "json");
+        assert!(snapshot.2, "highlighter should parse set_value text");
+        assert_eq!(snapshot.3, text.len());
+    }
+
+    #[gpui::test]
+    fn changing_language_clears_document_highlighter_and_reparses(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                assert_eq!(
+                    state.set_highlighter("json", cx),
+                    HighlighterChange::LanguageChanged
+                );
+                state.set_value("{\"answer\": 1}", window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                assert_eq!(
+                    state.set_highlighter("text", cx),
+                    HighlighterChange::PlainText
+                );
+                if let crate::input::mode::InputMode::CodeEditor { highlighter, .. } = &state.mode {
+                    assert!(
+                        highlighter.borrow().is_none(),
+                        "language changes should drop per-document parse state"
+                    );
+                }
+            });
+        });
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("plain text", window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let theme = HighlightTheme::default_dark();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                if let crate::input::mode::InputMode::CodeEditor { highlighter, .. } = &state.mode {
+                    let highlighter = highlighter.borrow();
+                    let highlighter = highlighter
+                        .as_ref()
+                        .expect("plain text highlighter should initialize");
+                    assert_eq!(highlighter.language().as_ref(), "text");
+                    assert!(highlighter.tree().is_some());
+                    _ = highlighter.styles(&(0..state.text.len()), &theme);
+                }
+            });
+        });
     }
 
     #[gpui::test]

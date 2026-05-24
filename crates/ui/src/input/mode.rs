@@ -258,7 +258,8 @@ impl InputMode {
                 }
 
                 let mut highlighter_ref = highlighter.borrow_mut();
-                if highlighter_ref.is_none() {
+                let created_highlighter = highlighter_ref.is_none();
+                if created_highlighter {
                     let phase_started = Instant::now();
                     let new_highlighter = SyntaxHighlighter::new(language);
                     highlighter_ref.replace(new_highlighter);
@@ -284,7 +285,21 @@ impl InputMode {
                 };
 
                 let phase_started = Instant::now();
-                let edit = replacement_input_edit(old_text, new_text, selected_range, change_text);
+                let edit = if created_highlighter {
+                    None
+                } else {
+                    Some(replacement_input_edit(
+                        old_text,
+                        new_text,
+                        selected_range,
+                        change_text,
+                    ))
+                };
+                let edit_source = if created_highlighter {
+                    "fresh_highlighter"
+                } else {
+                    "incremental_edit"
+                };
                 tracing::info!(
                     operation = "input_update_highlighter",
                     phase = "replacement_input_edit",
@@ -295,13 +310,14 @@ impl InputMode {
                     new_text_bytes = new_text.len(),
                     change_text_bytes = change_text.len(),
                     force,
+                    edit_source,
                     elapsed_ms = duration_ms(phase_started.elapsed()),
                     "input highlighter update phase completed"
                 );
 
                 const SYNC_PARSE_TIMEOUT: Duration = Duration::from_millis(2);
                 let phase_started = Instant::now();
-                let completed = h.update(Some(edit), new_text, Some(SYNC_PARSE_TIMEOUT));
+                let completed = h.update(edit, new_text, Some(SYNC_PARSE_TIMEOUT));
                 tracing::info!(
                     operation = "input_update_highlighter",
                     phase = "syntax_highlighter_update",
