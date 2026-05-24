@@ -6,6 +6,11 @@
 
 UI components for building fantastic desktop applications using [GPUI](https://gpui.rs).
 
+> Project note: this is a project-specific fork of `gpui-component` maintained
+> for [`srothgan/latex-editor`](https://github.com/srothgan/latex-editor),
+> primarily to support editor-specific syntax highlighting performance work,
+> including cached Tree-sitter language/query setup and responsive highlighting.
+
 ## Features
 
 - **Richness**: 60+ cross-platform desktop UI components.
