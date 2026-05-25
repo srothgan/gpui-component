@@ -1,6 +1,6 @@
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement, Render,
-    Styled, Window,
+    ScrollHandle, Styled, Window,
 };
 
 use gpui_component::{
@@ -8,6 +8,7 @@ use gpui_component::{
     button::{Button, ButtonGroup, ButtonVariants},
     checkbox::Checkbox,
     h_flex,
+    scroll::ScrollbarShow,
     tab::{Tab, TabBar},
     v_flex,
 };
@@ -19,6 +20,7 @@ pub struct TabsStory {
     active_tab_ix: usize,
     size: Size,
     menu: bool,
+    scroll_handle: ScrollHandle,
 }
 
 impl super::Story for TabsStory {
@@ -46,6 +48,7 @@ impl TabsStory {
             active_tab_ix: 0,
             size: Size::default(),
             menu: false,
+            scroll_handle: ScrollHandle::new(),
         }
     }
 
@@ -166,6 +169,31 @@ impl Render for TabsStory {
                                         .icon(IconName::Ellipsis),
                                 ),
                         ),
+                ),
+            )
+            .child(
+                section("Scrollable Tabs").max_w_md().child(
+                    TabBar::new("scrollable-tabs")
+                        .w_full()
+                        .track_scroll(&self.scroll_handle)
+                        .scrollbar_show(ScrollbarShow::Always)
+                        .with_size(self.size)
+                        .selected_index(self.active_tab_ix)
+                        .on_click(cx.listener(|this, ix: &usize, window, cx| {
+                            this.set_active_tab(*ix, window, cx);
+                        }))
+                        .child(Tab::new().label("Overview"))
+                        .child(Tab::new().label("Activity"))
+                        .child(Tab::new().label("Documents"))
+                        .child(Tab::new().label("Review"))
+                        .child(Tab::new().label("Branches"))
+                        .child(Tab::new().label("Deployments"))
+                        .child(Tab::new().label("Settings"))
+                        .child(Tab::new().label("Integrations"))
+                        .child(Tab::new().label("Automation"))
+                        .child(Tab::new().label("Permissions"))
+                        .child(Tab::new().label("History"))
+                        .child(Tab::new().label("Billing")),
                 ),
             )
             .child(

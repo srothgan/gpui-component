@@ -13,6 +13,7 @@ use super::{Tab, TabVariant};
 use crate::animation::{Lerp, ease_in_out_cubic};
 use crate::button::{Button, ButtonVariants as _};
 use crate::menu::{DropdownMenu as _, PopupMenuItem};
+use crate::scroll::{Scrollbar, ScrollbarShow};
 use crate::{
     ActiveTheme, ElementExt, Icon, IconName, Selectable, Sizable, Size, StyledExt, h_flex,
 };
@@ -42,6 +43,7 @@ pub struct TabBar {
     base: Stateful<Div>,
     style: StyleRefinement,
     scroll_handle: Option<ScrollHandle>,
+    scrollbar_show: Option<ScrollbarShow>,
     prefix: Option<AnyElement>,
     suffix: Option<AnyElement>,
     children: SmallVec<[Tab; 2]>,
@@ -63,6 +65,7 @@ impl TabBar {
             style: StyleRefinement::default(),
             children: SmallVec::new(),
             scroll_handle: None,
+            scrollbar_show: None,
             prefix: None,
             suffix: None,
             variant: TabVariant::default(),
@@ -113,6 +116,14 @@ impl TabBar {
     /// Track the scroll of the TabBar.
     pub fn track_scroll(mut self, scroll_handle: &ScrollHandle) -> Self {
         self.scroll_handle = Some(scroll_handle.clone());
+        self
+    }
+
+    /// Set the scrollbar show mode for a scrollable TabBar.
+    ///
+    /// If unset, scrollable tab bars use [`ScrollbarShow::Always`].
+    pub fn scrollbar_show(mut self, scrollbar_show: ScrollbarShow) -> Self {
+        self.scrollbar_show = Some(scrollbar_show);
         self
     }
 
@@ -400,6 +411,9 @@ impl RenderOnce for TabBar {
         let mut item_metas: Vec<(Option<SharedString>, Option<Icon>, bool)> = Vec::new();
         let selected_index = self.selected_index;
         let on_click = self.on_click.clone();
+        let scroll_handle = self.scroll_handle.clone();
+        let scrollbar_show = self.scrollbar_show.unwrap_or(ScrollbarShow::Always);
+        let scrollbar_id = format!("{}-scrollbar", self.id);
 
         self.base
             .group("tab-bar")
@@ -428,58 +442,86 @@ impl RenderOnce for TabBar {
             .refine_style(&self.style)
             .when_some(self.prefix, |this, prefix| this.child(prefix))
             .child(
-                h_flex().id("tabs").flex_1().overflow_x_hidden().child(
-                    h_flex()
-                        .id("tabs-inner")
-                        .relative()
-                        .gap(gap)
-                        .overflow_x_scroll()
-                        .when_some(self.scroll_handle, |this, scroll_handle| {
-                            this.track_scroll(&scroll_handle)
-                        })
-                        .when_some(bounds_rc.clone(), |this, rc| {
-                            this.on_prepaint(move |bounds, _, _| {
-                                rc.borrow_mut().container = bounds;
+                div()
+                    .id("tabs")
+                    .relative()
+                    .flex_1()
+                    .h_full()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(
+                        h_flex()
+                            .id("tabs-scroll")
+                            .relative()
+                            .w_full()
+                            .h_full()
+                            .min_w_0()
+                            .gap(gap)
+                            .overflow_x_scroll()
+                            .when_some(scroll_handle.clone(), |this, scroll_handle| {
+                                this.track_scroll(&scroll_handle)
                             })
-                        })
-                        .when_some(indicator_element, |this, ind| this.child(ind))
-                        .children(self.children.into_iter().enumerate().map(|(ix, child)| {
-                            item_metas.push((
-                                child.label.clone(),
-                                child.icon.clone(),
-                                child.disabled,
-                            ));
-                            let tab_bar_prefix = child.tab_bar_prefix.unwrap_or(true);
-                            let mut tab = child
-                                .ix(ix)
-                                .tab_bar_prefix(tab_bar_prefix)
-                                .with_variant(self.variant)
-                                .with_size(self.size);
-                            tab.indicator_active = has_indicator;
-                            let tab = tab
-                                .when_some(self.selected_index, |this, selected_ix| {
-                                    this.selected(selected_ix == ix)
+                            .when_some(bounds_rc.clone(), |this, rc| {
+                                this.on_prepaint(move |bounds, _, _| {
+                                    rc.borrow_mut().container = bounds;
                                 })
-                                .when_some(self.on_click.clone(), move |this, on_click| {
-                                    this.on_click(move |_, window, cx| on_click(&ix, window, cx))
-                                });
-
-                            if let Some(ref rc) = bounds_rc {
-                                let rc = rc.clone();
-                                div()
-                                    .on_prepaint(move |bounds, _, _| {
-                                        if let Some(slot) = rc.borrow_mut().tabs.get_mut(ix) {
-                                            *slot = bounds;
-                                        }
+                            })
+                            .when_some(indicator_element, |this, ind| this.child(ind))
+                            .children(self.children.into_iter().enumerate().map(|(ix, child)| {
+                                item_metas.push((
+                                    child.label.clone(),
+                                    child.icon.clone(),
+                                    child.disabled,
+                                ));
+                                let tab_bar_prefix = child.tab_bar_prefix.unwrap_or(true);
+                                let mut tab = child
+                                    .ix(ix)
+                                    .tab_bar_prefix(tab_bar_prefix)
+                                    .with_variant(self.variant)
+                                    .with_size(self.size);
+                                tab.indicator_active = has_indicator;
+                                let tab = tab
+                                    .when_some(self.selected_index, |this, selected_ix| {
+                                        this.selected(selected_ix == ix)
                                     })
-                                    .child(tab)
-                                    .into_any_element()
-                            } else {
-                                tab.into_any_element()
-                            }
-                        }))
-                        .when(has_suffix_or_menu, |this| this.child(self.last_empty_space)),
-                ),
+                                    .when_some(self.on_click.clone(), move |this, on_click| {
+                                        this.on_click(move |_, window, cx| {
+                                            on_click(&ix, window, cx)
+                                        })
+                                    });
+
+                                if let Some(ref rc) = bounds_rc {
+                                    let rc = rc.clone();
+                                    div()
+                                        .on_prepaint(move |bounds, _, _| {
+                                            if let Some(slot) = rc.borrow_mut().tabs.get_mut(ix) {
+                                                *slot = bounds;
+                                            }
+                                        })
+                                        .child(tab)
+                                        .into_any_element()
+                                } else {
+                                    tab.into_any_element()
+                                }
+                            }))
+                            .when(has_suffix_or_menu, |this| this.child(self.last_empty_space)),
+                    )
+                    .when_some(scroll_handle, |this, scroll_handle| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom_0()
+                                .h(Scrollbar::compact_width())
+                                .child(
+                                    Scrollbar::horizontal(&scroll_handle)
+                                        .compact()
+                                        .id(scrollbar_id)
+                                        .scrollbar_show(scrollbar_show),
+                                ),
+                        )
+                    }),
             )
             .when(self.menu, |this| {
                 this.child(
